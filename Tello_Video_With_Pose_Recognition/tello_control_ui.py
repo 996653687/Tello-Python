@@ -118,7 +118,12 @@ class TelloUI:
                     self.telloMoveForward(0.50) 
                 elif cmd == 'land':
                     self.telloLanding()
-                                            
+                
+                if self.agg_mode:
+                    self.agg_points = self.my_tello_agg.detect(self.frame)
+                    self.traj = self.my_tello_agg.planner()
+                    cmd = self.my_tello_agg.controller(self.traj) 
+
         except RuntimeError, e:
             print("[INFO] caught a RuntimeError")
     
