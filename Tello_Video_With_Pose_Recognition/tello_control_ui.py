@@ -4,11 +4,12 @@ import Tkinter as tki
 from Tkinter import Toplevel, Scale
 import threading
 import datetime
-import cv2
 import os
 import time
 from tello_pose import Tello_Pose
 import platform
+import numpy as np
+import cv2
 
 class TelloUI:
     """Wrapper class to enable the GUI."""
@@ -36,7 +37,23 @@ class TelloUI:
         self.pose_mode = False        
         # if the flag is TRUE,the auto-takeoff thread will stop waiting for the response from tello
         self.quit_waiting_flag = False
+        # if the detection and tracking mode is opened 
+        self.detect_track_mode = False
+        # if the flow mode is opened 
+        self.flow_mode = False        
         
+        # flow mode variables
+        self.prvs = None  # previous frame read from h264decoder and used for flow test 
+        self.next = None  # next frame read from h264decoder and used for flow test 
+        self.hsv = None  # flow visualization 
+        self.flow = None  # flow frame 
+      
+        # detection and tracking variables
+        self.iter = 0
+        self.obstacle_frames = 0
+        self.prev_mask = []
+        self.fgbg = cv2.createBackgroundSubtractorMOG2()
+
         # if the flag is TRUE,the pose recognition skeleton will be drawn on the GUI picture
         self.draw_skeleton_flag = False
         # pose recognition
@@ -62,6 +79,15 @@ class TelloUI:
                                    command=self.setPoseMode)
         self.btn_pose.pack(side="bottom", fill="both",
                            expand="yes", padx=10, pady=5)
+
+        self.btn_flow = tki.Button(self.root, text="Flow Status: Off",
+                                   command=self.setFlowMode)
+        self.btn_flow.pack(side="bottom", fill="both",
+                           expand="yes", padx=10, pady=5)
+        self.btn_detect = tki.Button(self.root, text="Detect/Track Status: Off",
+                                     command=self.setDetectMode)
+        self.btn_detect.pack(side="bottom", fill="both",
+                             expand="yes", padx=10, pady=5)
 
         self.btn_pause = tki.Button(self.root, text="Pause", relief="raised", command=self.pauseVideo)
         self.btn_pause.pack(side="bottom", fill="both",
@@ -118,15 +144,46 @@ class TelloUI:
                     self.telloMoveForward(0.50) 
                 elif cmd == 'land':
                     self.telloLanding()
-                
-                if self.agg_mode:
-                    self.agg_points = self.my_tello_agg.detect(self.frame)
-                    self.traj = self.my_tello_agg.planner()
-                    cmd = self.my_tello_agg.controller(self.traj) 
+
+
+               # TODO(jifu) 
+               # if self.agg_mode:
+               #     self.agg_points = self.my_tello_agg.detect(self.frame)
+               #     self.traj = self.my_tello_agg.planner()
+               #     cmd = self.my_tello_agg.controller(self.traj) 
 
         except RuntimeError, e:
             print("[INFO] caught a RuntimeError")
-    
+
+
+    def reactor(self, mask):
+        if len(self.prev_mask) == 0:
+            return
+        diff_mask = mask - self.prev_mask
+        diff = np.mean(diff_mask[:])
+        if diff > 1:
+            self.obstacle_frames = self.obstacle_frames + 1
+        elif diff < -1:
+            self.obstacle_frames = self.obstacle_frames - 1
+
+        self.reaction = 'idle'
+        if self.obstacle_frames > 10:
+            self.reaction = 'move_backward'
+        elif self.obstacle_frames < -10:
+            self.reaction = 'move_forward'  # vanilla aggressiveness
+
+        if self.reaction == 'move_backward':
+            dist = 0.50
+            if diff > 5:
+                dist = 1
+                self.telloMoveBackward(dist)
+        elif self.reaction == 'move_forward':
+            dist = 0.50
+            if diff < -5:
+                dist = 1
+            self.telloMoveForward(dist) 
+
+
     def _getGUIImage(self):
         """
         Main operation to read frames from h264decoder and draw skeleton on 
@@ -152,9 +209,36 @@ class TelloUI:
                     if self.points[partA] and self.points[partB]:
                         cv2.line(frame, self.points[partA], self.points[partB], (0, 255, 255), 2)
                         cv2.circle(frame, self.points[partA], 8, (0, 0, 255), thickness=-1, lineType=cv2.FILLED)
+                    
+            # computes and visualizae dense optical flow
+            if self.flow_mode:
+                # ref: https://docs.opencv.org/3.4/d4/dee/tutorial_optical_flow.html
+                self.next = cv2.cvtColor(frame,cv2.COLOR_BGR2GRAY)
+                if self.prvs is None:
+                    self.hsv = np.zeros_like(frame)
+                    self.hsv[...,1] = 255
+                if self.prvs is not None:
+                    self.flow = cv2.calcOpticalFlowFarneback(self.prvs,self.next, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+                    mag, ang = cv2.cartToPolar(self.flow[...,0], self.flow[...,1])
+                    self.hsv[...,0] = ang*180/np.pi/2
+                    self.hsv[...,2] = cv2.normalize(mag,None,0,255,cv2.NORM_MINMAX)
+                    bgr = cv2.cvtColor(self.hsv,cv2.COLOR_HSV2BGR)
+                    image = Image.fromarray(bgr)
+                    # save flow visualization for debug
+                    base = './flow/'
+                    time_stamp = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
+                    file = base + time_stamp
+                    image.save(file + ".thumbnail", "JPEG")
+                self.prvs = self.next
             
-            # transfer the format from frame to image         
-            image = Image.fromarray(frame)
+            # reacts (vanilla move back) based on foreground objects
+            # (TODO) Detects and tracks objects, motion plans
+            if self.detect_track_mode:
+                # transfer the format from frame to image         
+                mask = self.fgbg.apply(frame)
+                if self.iter > 0:
+                    v = self.reactor(mask)
+                self.prev_mask = mask
 
             # we found compatibility problem between Tkinter,PIL and Macos,and it will 
             # sometimes result the very long preriod of the "ImageTk.PhotoImage" function,
@@ -166,6 +250,8 @@ class TelloUI:
                 thread_tmp = threading.Thread(target=self._updateGUIImage,args=(image,))
                 thread_tmp.start()
                 time.sleep(0.03) 
+
+            self.iter = self.iter + 1
            
     def _updateGUIImage(self,image):
         """
@@ -378,6 +464,28 @@ class TelloUI:
         else:
             self.pose_mode = False
             self.btn_pose.config(text='Pose Recognition Status: Off')
+    
+    def setFlowMode(self):
+        """
+        Toggle the open/close of flow process mode
+        """
+        if self.flow_mode is False:
+            self.flow_mode = True
+            self.btn_flow.config(text='Flow Status: On')
+        else:
+            self.flow_mode = False
+            self.btn_flow.config(text='Flow Status: Off')
+
+    def setDetectMode(self):
+        """
+        Toggle the open/close of flow process mode
+        """
+        if self.detect_track_mode is False:
+            self.detect_track_mode = True
+            self.btn_detect.config(text='Detect/Track Status: On')
+        else:
+            self.detect_track_mode = False
+            self.btn_detect.config(text='Detect/Track Status: Off')
 
     def pauseVideo(self):
         """
